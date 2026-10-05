@@ -27,19 +27,21 @@ def make_request(
 
 
 def slot(disturbance, *commands):
-    """commands: (id, mode, correction, energy) 元组序列。"""
-    return {
-        "disturbance": list(disturbance),
-        "commands": [
-            {
-                "id": cid,
-                "mode": mode,
-                "correction": list(corr),
-                "energy": energy,
-            }
-            for cid, mode, corr, energy in commands
-        ],
-    }
+    """commands: (id, mode, correction, energy) 或
+    (id, mode, correction, energy, allowed_predecessor_ids) 元组序列。"""
+    built = []
+    for c in commands:
+        cid, mode, corr, energy = c[:4]
+        cmd = {
+            "id": cid,
+            "mode": mode,
+            "correction": list(corr),
+            "energy": energy,
+        }
+        if len(c) >= 5 and c[4] is not None:
+            cmd["allowed_predecessor_ids"] = list(c[4])
+        built.append(cmd)
+    return {"disturbance": list(disturbance), "commands": built}
 
 
 def brute_force_best(req: dict):
@@ -61,8 +63,13 @@ def brute_force_best(req: dict):
         switches = 0
         ids = []
         prev_mode = None
+        prev_id = None
         ok = True
         for s, cmd in zip(req["slots"], combo):
+            allowed = cmd.get("allowed_predecessor_ids")
+            if allowed is not None and prev_id not in allowed:
+                ok = False
+                break
             d = s["disturbance"]
             c = cmd["correction"]
             state = (state[0] + d[0] + c[0], state[1] + d[1] + c[1])
@@ -73,6 +80,7 @@ def brute_force_best(req: dict):
             if prev_mode is not None and prev_mode != cmd["mode"]:
                 switches += 1
             prev_mode = cmd["mode"]
+            prev_id = cmd["id"]
             ids.append(cmd["id"])
         if ok and in_rect(state, target):
             label = (energy, switches, tuple(ids))

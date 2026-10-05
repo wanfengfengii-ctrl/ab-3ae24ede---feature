@@ -6,15 +6,20 @@
 
 要求 p_1 ... p_T 全部位于统一矩形安全域，且 p_T 位于目标矩形。
 
+部分指令带接续白名单 ``allowed_predecessor_ids``：仅当紧邻前一时隙选中了名单
+中的某个编号时，该指令才可执行；省略该字段表示不限制前序。首时隙不允许出现
+白名单（由语义校验保证）。
+
 优化目标按严格优先级依次最小化：
   1. 总能耗；
   2. 相邻时隙模式切换次数；
   3. 指令编号序列（按字典序）。
 
-实现上以前向动态规划逐层扩展可达前沿。分桶键为 ``(动量, 上一条指令模式)``：
-因为模式切换次数依赖“上一条指令的模式”，同一动量、不同末模式的两条路径
-不能简单互相支配，必须分桶保存；桶内未来代价只取决于桶键，保留字典序最小
-标签即为安全支配。
+实现上以前向动态规划逐层扩展可达前沿。分桶键为
+``(动量, 上一条指令模式, 上一条指令编号)``：模式切换次数依赖“上一条指令的
+模式”、下一层的接续限制依赖“上一条指令的编号”，因此同一动量、不同末模式或
+不同末编号的两条路径不能简单互相支配，必须分桶保存；桶内未来代价只取决于桶
+键，保留字典序最小标签即为安全支配。
 """
 
 from dataclasses import dataclass
@@ -23,7 +28,8 @@ from typing import Optional
 from .models import Command, CompileRequest, Rectangle
 
 Vec = tuple[int, int]
-BucketKey = tuple[Vec, Optional[str]]
+# 末态动量、末指令模式（t=0 为 None）、末指令编号（t=0 为 None）。
+BucketKey = tuple[Vec, Optional[str], Optional[int]]
 
 # 能耗来自 JSON 浮点，不同指令组合求和可能产生 1e-16 级误差，
 # 该容差内视为能耗并列，交由切换次数与编号序列裁决。
@@ -48,8 +54,10 @@ class InfeasiblePlanError(Exception):
     """不存在满足约束的计划。
 
     ``last_reachable_slot`` 为仍存在可达状态的最后时隙编号（已完成的时隙数，
-    0 表示第一时隙就无法留在安全域）；``reachable_states`` 为该层不同可达
-    动量状态的数量。
+    0 表示第一时隙就无法留在安全域或无法接续）；``reachable_states`` 为该层
+    不同可达动量状态的数量。``reason`` 区分切断原因：``no_safe_path`` 为安全
+    域在某层切断，``broken_predecessor_chain`` 为安全落点存在但全部被接续白
+    名单挡住，``target_unreachable`` 为整窗可达但末态无人进入目标矩形。
     """
 
     def __init__(self, reason: str, last_reachable_slot: int, reachable_states: int) -> None:
@@ -82,7 +90,7 @@ def _in_rect(p: Vec, rect: Rectangle) -> bool:
 
 
 def _distinct_states(layer: dict[BucketKey, _Node]) -> int:
-    return len({state for state, _mode in layer})
+    return len({state for state, _mode, _cmd_id in layer})
 
 
 def compile_plan(request: CompileRequest) -> dict:
@@ -95,8 +103,8 @@ def compile_plan(request: CompileRequest) -> dict:
     safety = request.safety_region
     target = request.target_region
 
-    # layer_t：完成第 t 个时隙后的可达前沿；t=0 只有初始状态、无历史模式。
-    start_key: BucketKey = (initial, None)
+    # layer_t：完成第 t 个时隙后的可达前沿；t=0 只有初始状态，无历史指令。
+    start_key: BucketKey = (initial, None, None)
     layers: list[dict[BucketKey, _Node]] = [
         {start_key: _Node(0.0, 0, (), None, None, None)}
     ]
@@ -104,9 +112,24 @@ def compile_plan(request: CompileRequest) -> dict:
     for t, slot in enumerate(request.slots, start=1):
         previous = layers[t - 1]
         current: dict[BucketKey, _Node] = {}
+        # 诊断用：本层是否出现过“落在安全域内但被接续白名单挡住”的边。
+        chain_blocked = False
 
-        for (state, prev_mode), node in previous.items():
+        for (state, prev_mode, prev_id), node in previous.items():
             for cmd in slot.commands:
+                allowed = cmd.allowed_predecessor_ids
+                if allowed is not None and prev_id not in allowed:
+                    # 前序编号不在白名单：先仍判定安全落点，便于区分切断原因。
+                    cx0, cy0 = cmd.correction
+                    dx0, dy0 = slot.disturbance
+                    probe: Vec = (
+                        state[0] + dx0 + cx0,
+                        state[1] + dy0 + cy0,
+                    )
+                    if _in_rect(probe, safety):
+                        chain_blocked = True
+                    continue
+
                 cx, cy = cmd.correction
                 dx, dy = slot.disturbance
                 nxt_state: Vec = (state[0] + dx + cx, state[1] + dy + cy)
@@ -122,18 +145,19 @@ def compile_plan(request: CompileRequest) -> dict:
                     switches=switches,
                     ids=node.ids + (cmd.id,),
                     mode=cmd.mode,
-                    prev_key=(state, prev_mode),
+                    prev_key=(state, prev_mode, prev_id),
                     command=cmd,
                 )
-                key: BucketKey = (nxt_state, cmd.mode)
+                key: BucketKey = (nxt_state, cmd.mode, cmd.id)
                 incumbent = current.get(key)
                 if incumbent is None or rank_lt(candidate.label(), incumbent.label()):
                     current[key] = candidate
 
         if not current:
-            # 安全域在本时隙被切断：上一层即最后可达层。
+            # 本层被切断：若存在安全落点却全部卡在接续关系上，则属于接续断链；
+            # 否则与旧语义一致——安全域在本时隙被切断。上一层即最后可达层。
             raise InfeasiblePlanError(
-                reason="no_safe_path",
+                reason="broken_predecessor_chain" if chain_blocked else "no_safe_path",
                 last_reachable_slot=t - 1,
                 reachable_states=_distinct_states(previous),
             )

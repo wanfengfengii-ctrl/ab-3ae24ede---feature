@@ -10,27 +10,33 @@ from app.planner import InfeasiblePlanError, compile_plan
 from .conftest import brute_force_best, make_request
 
 
-def _random_request(rng: random.Random, n_slots: int, n_cmds: int) -> dict:
+def _random_request(rng: random.Random, n_slots: int, n_cmds: int,
+                    with_chains: bool = False) -> dict:
     modes = ["A", "B", "C"]
     slots = []
-    for _ in range(n_slots):
+    prev_ids: list[int] = []
+    for t in range(n_slots):
         ids = rng.sample(range(1, 100), n_cmds)
         commands = []
         for cid in ids:
-            commands.append(
-                {
-                    "id": cid,
-                    "mode": rng.choice(modes),
-                    "correction": [rng.randint(-3, 3), rng.randint(-3, 3)],
-                    "energy": rng.choice([0.0, 0.5, 1.0, 2.0, 5.0]),
-                }
-            )
+            cmd = {
+                "id": cid,
+                "mode": rng.choice(modes),
+                "correction": [rng.randint(-3, 3), rng.randint(-3, 3)],
+                "energy": rng.choice([0.0, 0.5, 1.0, 2.0, 5.0]),
+            }
+            # 约 1/3 的非首时隙指令挂接续白名单，名单从前一隙编号中取。
+            if with_chains and t > 0 and prev_ids and rng.random() < 1 / 3:
+                k = rng.randint(1, min(5, len(prev_ids)))
+                cmd["allowed_predecessor_ids"] = rng.sample(prev_ids, k)
+            commands.append(cmd)
         slots.append(
             {
                 "disturbance": [rng.randint(-2, 2), rng.randint(-2, 2)],
                 "commands": commands,
             }
         )
+        prev_ids = ids
     bound = rng.randint(4, 12)
     return make_request(
         initial=(rng.randint(-2, 2), rng.randint(-2, 2)),
@@ -58,6 +64,39 @@ def test_dp_matches_brute_force(seed):
     n_cmds = rng.randint(2, 3)
     req = _random_request(rng, n_slots, n_cmds)
     # 若目标域不包含于安全域，语义校验会拒绝；对拍仅关心规划器，直接缩窄。
+    s, t = req["safety_region"], req["target_region"]
+    t["x_min"] = max(t["x_min"], s["x_min"])
+    t["x_max"] = min(t["x_max"], s["x_max"])
+    t["y_min"] = max(t["y_min"], s["y_min"])
+    t["y_max"] = min(t["y_max"], s["y_max"])
+    req["initial_momentum"] = [
+        min(max(req["initial_momentum"][0], s["x_min"]), s["x_max"]),
+        min(max(req["initial_momentum"][1], s["y_min"]), s["y_max"]),
+    ]
+
+    expected = brute_force_best(req)
+    try:
+        result = compile_plan(CompileRequest.model_validate(req))
+    except InfeasiblePlanError:
+        assert expected is None
+        return
+
+    assert expected is not None
+    got = (
+        result["objectives"]["total_energy"],
+        result["objectives"]["mode_switches"],
+        tuple(result["objectives"]["command_id_sequence"]),
+    )
+    assert got == expected
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_dp_matches_brute_force_with_chains(seed):
+    """随机接续白名单下，DP 仍须与独立穷举参考完全一致（含无解一致）。"""
+    rng = random.Random(1000 + seed)
+    n_slots = 8
+    n_cmds = rng.randint(2, 3)
+    req = _random_request(rng, n_slots, n_cmds, with_chains=True)
     s, t = req["safety_region"], req["target_region"]
     t["x_min"] = max(t["x_min"], s["x_min"])
     t["x_max"] = min(t["x_max"], s["x_max"])

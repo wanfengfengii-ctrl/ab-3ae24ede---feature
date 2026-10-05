@@ -3,7 +3,7 @@
 动量、扰动、修正量统一使用二维整数向量（JSON 数组，长度恰好为 2）。
 """
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -23,6 +23,15 @@ class Command(StrictModel):
     mode: str = Field(min_length=1, description="磁力矩器工作模式")
     correction: IntVec = Field(description="二维修正量")
     energy: float = Field(ge=0.0, description="非负能耗")
+    allowed_predecessor_ids: Optional[list[int]] = Field(
+        default=None,
+        min_length=1,
+        max_length=5,
+        description=(
+            "接续白名单：本指令只能在紧邻前一时隙选中了名单中的编号时执行；"
+            "省略表示不限制前序。首时隙不得提供，编号须存在于紧邻前一时隙。"
+        ),
+    )
 
     @field_validator("energy")
     @classmethod

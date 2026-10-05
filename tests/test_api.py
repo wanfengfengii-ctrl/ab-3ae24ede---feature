@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 
-from .conftest import eight_slots, make_request, slot
+from .conftest import eight_slots, make_request, slot, slot
 
 client = TestClient(app)
 
@@ -206,3 +206,135 @@ def test_parameter_error_differs_from_real_infeasibility():
         slots=eight_slots(),
     )
     assert _compile(infeasible).status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# allowed_predecessor_ids 接续白名单
+# ---------------------------------------------------------------------------
+
+FIELD = "allowed_predecessor_ids"
+
+
+def test_predecessor_list_on_first_slot_is_located():
+    body = make_request(slots=eight_slots())
+    body["slots"][0]["commands"][0][FIELD] = [9]
+    r = _compile(body)
+    assert r.status_code == 422
+    data = r.json()
+    assert data["error"] == "invalid_request"
+    assert data["field"] == f"slots[0].commands[0].{FIELD}"
+
+
+def test_predecessor_list_duplicate_entries_located():
+    body = make_request(slots=eight_slots())
+    body["slots"][2]["commands"][1][FIELD] = [1, 1]
+    r = _compile(body)
+    assert r.status_code == 422
+    assert r.json()["field"] == f"slots[2].commands[1].{FIELD}"
+
+
+def test_predecessor_list_unknown_id_located():
+    body = make_request(slots=eight_slots())
+    # 404 不存在于第 1 隙（第 1 隙编号为 1、2）。
+    body["slots"][2]["commands"][1][FIELD] = [1, 404]
+    r = _compile(body)
+    assert r.status_code == 422
+    assert r.json()["field"] == f"slots[2].commands[1].{FIELD}"
+
+
+def test_predecessor_list_cardinality_bounds():
+    body_empty = make_request(slots=eight_slots())
+    body_empty["slots"][1]["commands"][0][FIELD] = []
+    assert _compile(body_empty).status_code == 422
+
+    body_too_many = make_request(slots=eight_slots())
+    body_too_many["slots"][1]["commands"][0][FIELD] = [1, 2, 3, 4, 5, 6]
+    r = _compile(body_too_many)
+    assert r.status_code == 422
+    assert any(FIELD in d["field"] for d in r.json()["details"])
+
+
+def test_predecessor_list_wrong_type_located():
+    body = make_request(slots=eight_slots())
+    body["slots"][1]["commands"][0][FIELD] = [1, "x"]
+    r = _compile(body)
+    assert r.status_code == 422
+    assert any(FIELD in d["field"] for d in r.json()["details"])
+
+
+def test_chain_feasible_smoke():
+    """受限接续可行：响应逐隙选择满足每条受限指令的前序编号在名单内。"""
+    slots = eight_slots()
+    # 第 2 隙（0 基 1）起：id=2 只允许跟随第 1 隙编号 1。
+    for s in slots[1:]:
+        for cmd in s["commands"]:
+            if cmd["id"] == 2:
+                cmd[FIELD] = [1]
+    r = _compile(make_request(slots=slots))
+    assert r.status_code == 200, r.text
+    data = r.json()
+    ids = [sel["command_id"] for sel in data["selected"]]
+    for prev, cur in zip(ids, ids[1:]):
+        if cur == 2:
+            assert prev == 1
+    assert len(data["momentums"]) == 8
+    assert set(data["objectives"]) == {
+        "total_energy",
+        "mode_switches",
+        "command_id_sequence",
+    }
+
+
+def test_broken_chain_returns_409_with_diagnostics():
+    """接续断链：409、reason=broken_predecessor_chain，并报告最后可达层。"""
+    slots = [
+        slot((0, 0), (1, "A", (100, 0), 1.0), (2, "B", (0, 0), 1.0)),
+        slot((0, 0), (1, "A", (0, 0), 1.0, [1]), (2, "B", (0, 0), 1.0, [1])),
+    ] + [
+        slot((0, 0), (1, "A", (0, 0), 1.0), (2, "B", (0, 0), 1.0))
+        for _ in range(6)
+    ]
+    body = make_request(
+        safety={"x_min": -10, "x_max": 10, "y_min": -10, "y_max": 10},
+        target={"x_min": -10, "x_max": 10, "y_min": -10, "y_max": 10},
+        slots=slots,
+    )
+    r = _compile(body)
+    assert r.status_code == 409
+    data = r.json()
+    assert data["error"] == "no_feasible_plan"
+    assert data["reason"] == "broken_predecessor_chain"
+    assert data["last_reachable_slot"] == 1
+    assert data["reachable_states"] == 1
+
+
+def test_legacy_request_without_field_is_unchanged():
+    """旧请求回归：不带新字段时响应契约与最优结果保持不变。"""
+    body = make_request(slots=eight_slots())
+    assert FIELD not in body["slots"][0]["commands"][0]
+    r = _compile(body)
+    assert r.status_code == 200
+    data = r.json()
+    assert set(data) == {
+        "feasible",
+        "slot_count",
+        "selected",
+        "momentums",
+        "final_momentum",
+        "objectives",
+    }
+    assert set(data["selected"][0]) == {
+        "slot",
+        "command_id",
+        "mode",
+        "correction",
+        "energy",
+    }
+    # 与独立穷举参考完全一致，确保旧请求的最优结果不发生漂移。
+    from .conftest import brute_force_best
+
+    expected = brute_force_best(body)
+    assert expected is not None
+    assert data["objectives"]["total_energy"] == expected[0]
+    assert data["objectives"]["mode_switches"] == expected[1]
+    assert tuple(data["objectives"]["command_id_sequence"]) == expected[2]

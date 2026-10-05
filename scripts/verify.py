@@ -4,8 +4,8 @@
   1. 等待并确认 API 健康；
   2. 核对代码测试（pytest 全套）；
   3. 核对镜像构建契约（非 root、应用与工具链可导入、健康端点契约）；
-  4. 业务冒烟：可行计划、并列裁决（三级目标）、真实无解诊断、
-     以及参数错误与无解的区分。
+  4. 业务冒烟：可行计划、并列裁决（三级目标）、受限接续可行、接续断链无解、
+     真实无解诊断、参数错误与无解的区分，以及旧请求回归。
 """
 
 import json
@@ -58,13 +58,14 @@ def _wait_for_health(timeout: float = 60.0) -> bool:
 
 
 def _slot(disturbance, *commands):
-    return {
-        "disturbance": list(disturbance),
-        "commands": [
-            {"id": cid, "mode": mode, "correction": list(corr), "energy": energy}
-            for cid, mode, corr, energy in commands
-        ],
-    }
+    built = []
+    for c in commands:
+        cid, mode, corr, energy = c[:4]
+        cmd = {"id": cid, "mode": mode, "correction": list(corr), "energy": energy}
+        if len(c) >= 5 and c[4] is not None:
+            cmd["allowed_predecessor_ids"] = list(c[4])
+        built.append(cmd)
+    return {"disturbance": list(disturbance), "commands": built}
 
 
 WIDE_SAFETY = {"x_min": -100, "x_max": 100, "y_min": -100, "y_max": 100}
@@ -115,7 +116,7 @@ def smoke_feasible() -> bool:
     if tuple(data["final_momentum"]) != tuple(data["momentums"][-1]):
         ok = False
 
-    _log(ok, "业务冒烟 1/4：可行计划（选择、逐隙动量、三项目标）")
+    _log(ok, "业务冒烟 1/7：可行计划（选择、逐隙动量、三项目标）")
     return ok
 
 
@@ -132,7 +133,96 @@ def smoke_tie_breaking() -> bool:
         and data["objectives"]["mode_switches"] == 0
         and data["objectives"]["command_id_sequence"] == [3] * 8
     )
-    _log(ok, f"业务冒烟 2/4：并列裁决（能耗→切换数→编号序列） 实际目标={data.get('objectives') if status == 200 else data}")
+    _log(ok, f"业务冒烟 2/7：并列裁决（能耗→切换数→编号序列） 实际目标={data.get('objectives') if status == 200 else data}")
+    return ok
+
+
+def smoke_restricted_chain_feasible() -> bool:
+    """受限接续可行：B 更省能但只能跟随 A，输出序列须满足逐隙接续关系。"""
+    slots = []
+    for t in range(1, 9):
+        ca = (1, "A", (0, 0), 1.0)
+        cb = (2, "B", (0, 0), 0.1)
+        if t >= 2:
+            cb = (*cb, [1])  # B 只允许紧邻前隙选中 id=1（A）
+        slots.append(_slot((0, 0), ca, cb))
+    status, data = _post_json(COMPILE_URL, _base_body(slots))
+    ok = status == 200 and data.get("feasible") is True
+    if ok:
+        ids = [sel["command_id"] for sel in data["selected"]]
+        ok = all(prev == 1 for prev, cur in zip(ids, ids[1:]) if cur == 2)
+        # 4 个不相邻的 B 为能耗最优：总能耗 4*1.0 + 4*0.1。
+        ok = ok and abs(data["objectives"]["total_energy"] - 4.4) < 1e-9
+    _log(
+        ok,
+        f"业务冒烟 3/7：受限接续可行（白名单逐隙成立） 实际 {status}: "
+        f"{data.get('objectives') if status == 200 else data}",
+    )
+    return ok
+
+
+def smoke_broken_chain_infeasible() -> bool:
+    """接续断链无解：409 且 reason=broken_predecessor_chain，报告最后可达层。"""
+    # 第 1 隙 id=1 修正 (100,0) 被安全域排除，仅 id=2 可达；
+    # 第 2 隙两条指令白名单都只含编号 1（编号 1 在第 1 隙存在，输入合法），断链。
+    slots = [
+        _slot((0, 0), (1, "A", (100, 0), 1.0), (2, "B", (0, 0), 1.0)),
+        _slot((0, 0), (1, "A", (0, 0), 1.0, [1]), (2, "B", (0, 0), 1.0, [1])),
+    ] + [
+        _slot((0, 0), (1, "A", (0, 0), 1.0), (2, "B", (0, 0), 1.0))
+        for _ in range(6)
+    ]
+    region = {"x_min": -10, "x_max": 10, "y_min": -10, "y_max": 10}
+    body = _base_body(slots, safety=dict(region), target=dict(region))
+    status, data = _post_json(COMPILE_URL, body)
+    ok = (
+        status == 409
+        and data.get("error") == "no_feasible_plan"
+        and data.get("reason") == "broken_predecessor_chain"
+        and data.get("last_reachable_slot") == 1
+        and data.get("reachable_states") == 1
+    )
+    _log(
+        ok,
+        f"业务冒烟 4/7：接续断链无解（409、最后可达时隙、可达动量数） 实际 {status}: {data}",
+    )
+    return ok
+
+
+def smoke_legacy_request_regression() -> bool:
+    """旧请求回归：不带 allowed_predecessor_ids 时请求、响应与裁决保持兼容。"""
+    slots = [
+        _slot((0, 0), (1, "A", (1, 0), 1.0), (2, "B", (-1, 0), 2.0)),
+        _slot((0, 1), (1, "A", (0, -1), 1.0), (2, "B", (0, 0), 1.0)),
+        _slot((1, 0), (1, "A", (-1, 0), 1.0), (2, "B", (0, 1), 3.0)),
+        _slot((0, 0), (1, "A", (0, 0), 2.0), (2, "B", (0, 0), 1.0)),
+        _slot((-1, 0), (1, "A", (1, 0), 1.0), (2, "B", (0, 0), 2.0)),
+        _slot((0, -1), (1, "A", (0, 1), 1.0), (2, "B", (0, 0), 1.5)),
+        _slot((0, 0), (1, "A", (0, 0), 1.0), (2, "B", (1, 0), 0.5)),
+        _slot((0, 0), (1, "A", (0, 0), 1.0), (2, "B", (0, -1), 2.0)),
+    ]
+    body = _base_body(slots)
+    assert all(
+        "allowed_predecessor_ids" not in cmd
+        for s in slots
+        for cmd in s["commands"]
+    )
+    status, data = _post_json(COMPILE_URL, body)
+    ok = (
+        status == 200
+        and data.get("feasible") is True
+        and set(data)
+        == {"feasible", "slot_count", "selected", "momentums",
+            "final_momentum", "objectives"}
+        and set(data["objectives"])
+        == {"total_energy", "mode_switches", "command_id_sequence"}
+        and len(data["selected"]) == 8
+    )
+    _log(
+        ok,
+        f"业务冒烟 5/7：旧请求回归（无新字段时响应契约不变） 实际 {status}: "
+        f"{data.get('objectives') if status == 200 else data}",
+    )
     return ok
 
 
@@ -156,7 +246,7 @@ def smoke_infeasible() -> bool:
     )
     _log(
         ok,
-        f"业务冒烟 3/4：真实无解诊断（409、最后可达时隙、可达状态数） 实际 {status}: {data if not ok else 'last_reachable_slot=0, reachable_states=1'}",
+        f"业务冒烟 6/7：真实无解诊断（409、最后可达时隙、可达状态数） 实际 {status}: {data if not ok else 'last_reachable_slot=0, reachable_states=1'}",
     )
     return ok
 
@@ -175,7 +265,7 @@ def smoke_param_error() -> bool:
     )
     _log(
         ok and located,
-        f"业务冒烟 4/4：参数错误定位字段（422，区别于 409） 实际 {status}: {data}",
+        f"业务冒烟 7/7：参数错误定位字段（422，区别于 409） 实际 {status}: {data}",
     )
     return ok and located
 
@@ -218,6 +308,9 @@ def main() -> int:
         run_pytest(),
         smoke_feasible(),
         smoke_tie_breaking(),
+        smoke_restricted_chain_feasible(),
+        smoke_broken_chain_infeasible(),
+        smoke_legacy_request_regression(),
         smoke_infeasible(),
         smoke_param_error(),
     ]

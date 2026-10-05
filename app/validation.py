@@ -65,3 +65,28 @@ def validate_semantics(req: CompileRequest) -> None:
                     f"时隙 {t}（0 基）内指令编号 {cmd.id} 重复，编号须在时隙内唯一",
                 )
             seen.add(cmd.id)
+
+        # 接续白名单（allowed_predecessor_ids）跨字段约束。
+        prev_ids = {cmd.id for cmd in req.slots[t - 1].commands} if t > 0 else set()
+        for c, cmd in enumerate(slot.commands):
+            field = f"slots[{t}].commands[{c}].allowed_predecessor_ids"
+            if cmd.allowed_predecessor_ids is None:
+                continue
+            if t == 0:
+                raise SemanticError(
+                    field,
+                    "首时隙没有紧邻前一时隙，不得提供 allowed_predecessor_ids",
+                )
+            ids = cmd.allowed_predecessor_ids
+            if len(set(ids)) != len(ids):
+                raise SemanticError(
+                    field,
+                    "allowed_predecessor_ids 中的编号必须互异，不得重复",
+                )
+            missing = [pid for pid in ids if pid not in prev_ids]
+            if missing:
+                raise SemanticError(
+                    field,
+                    "allowed_predecessor_ids 的编号必须存在于紧邻前一时隙，"
+                    f"时隙 {t - 1}（0 基）中不存在编号 {missing}",
+                )

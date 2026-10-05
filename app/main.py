@@ -51,12 +51,19 @@ async def _validation_error_handler(
 async def _infeasible_handler(
     _request: Request, exc: InfeasiblePlanError
 ) -> JSONResponse:
+    messages = {
+        "broken_predecessor_chain": (
+            "不存在满足接续限制的完整指令序列：合法指令的前序关系在某层断链"
+        ),
+    }
     return JSONResponse(
         status_code=409,
         content={
             "error": "no_feasible_plan",
             "reason": exc.reason,
-            "message": "不存在满足安全域与末态目标的完整指令序列",
+            "message": messages.get(
+                exc.reason, "不存在满足安全域与末态目标的完整指令序列"
+            ),
             "last_reachable_slot": exc.last_reachable_slot,
             "reachable_states": exc.reachable_states,
         },
