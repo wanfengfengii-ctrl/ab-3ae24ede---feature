@@ -27,25 +27,29 @@ def make_request(
 
 
 def slot(disturbance, *commands):
-    """commands: (id, mode, correction, energy) 元组序列。"""
+    """commands: (id, mode, correction, energy[, allowed_predecessor_ids]) 元组序列。"""
+    cmds = []
+    for spec in commands:
+        cmd = {
+            "id": spec[0],
+            "mode": spec[1],
+            "correction": list(spec[2]),
+            "energy": spec[3],
+        }
+        if len(spec) > 4 and spec[4] is not None:
+            cmd["allowed_predecessor_ids"] = list(spec[4])
+        cmds.append(cmd)
     return {
         "disturbance": list(disturbance),
-        "commands": [
-            {
-                "id": cid,
-                "mode": mode,
-                "correction": list(corr),
-                "energy": energy,
-            }
-            for cid, mode, corr, energy in commands
-        ],
+        "commands": cmds,
     }
 
 
 def brute_force_best(req: dict):
     """穷举所有指令组合，返回 (energy, switches, ids) 或 None。
 
-    与生产 DP 的语义完全独立，作为对拍参考。
+    与生产 DP 的语义完全独立，作为对拍参考。声明了
+    allowed_predecessor_ids 的指令仅可跟在名单中的已选编号之后。
     """
     safety = req["safety_region"]
     target = req["target_region"]
@@ -61,8 +65,13 @@ def brute_force_best(req: dict):
         switches = 0
         ids = []
         prev_mode = None
+        prev_id = None
         ok = True
         for s, cmd in zip(req["slots"], combo):
+            allowed = cmd.get("allowed_predecessor_ids")
+            if allowed is not None and prev_id not in allowed:
+                ok = False
+                break
             d = s["disturbance"]
             c = cmd["correction"]
             state = (state[0] + d[0] + c[0], state[1] + d[1] + c[1])
@@ -73,6 +82,7 @@ def brute_force_best(req: dict):
             if prev_mode is not None and prev_mode != cmd["mode"]:
                 switches += 1
             prev_mode = cmd["mode"]
+            prev_id = cmd["id"]
             ids.append(cmd["id"])
         if ok and in_rect(state, target):
             label = (energy, switches, tuple(ids))

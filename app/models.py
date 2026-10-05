@@ -23,6 +23,15 @@ class Command(StrictModel):
     mode: str = Field(min_length=1, description="磁力矩器工作模式")
     correction: IntVec = Field(description="二维修正量")
     energy: float = Field(ge=0.0, description="非负能耗")
+    allowed_predecessor_ids: list[int] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=5,
+        description=(
+            "允许紧邻前一时隙所选指令的编号名单（1–5 个互异整数）；"
+            "省略表示不限制前序。首时隙不得提供"
+        ),
+    )
 
     @field_validator("energy")
     @classmethod

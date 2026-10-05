@@ -50,14 +50,8 @@ def _random_request(rng: random.Random, n_slots: int, n_cmds: int) -> dict:
     )
 
 
-@pytest.mark.parametrize("seed", range(60))
-def test_dp_matches_brute_force(seed):
-    rng = random.Random(seed)
-    # 固定 8 隙（穷举规模 2^8~3^8），指令数随机 2~3。
-    n_slots = 8
-    n_cmds = rng.randint(2, 3)
-    req = _random_request(rng, n_slots, n_cmds)
-    # 若目标域不包含于安全域，语义校验会拒绝；对拍仅关心规划器，直接缩窄。
+def _make_valid(req: dict) -> dict:
+    """把随机请求收敛到语义校验接受的范围内（对拍只关心规划器）。"""
     s, t = req["safety_region"], req["target_region"]
     t["x_min"] = max(t["x_min"], s["x_min"])
     t["x_max"] = min(t["x_max"], s["x_max"])
@@ -67,7 +61,21 @@ def test_dp_matches_brute_force(seed):
         min(max(req["initial_momentum"][0], s["x_min"]), s["x_max"]),
         min(max(req["initial_momentum"][1], s["y_min"]), s["y_max"]),
     ]
+    return req
 
+
+def _add_random_predecessor_rules(rng: random.Random, req: dict) -> dict:
+    """给非首时隙的指令随机挂上合法接续名单（引用紧邻前隙真实编号）。"""
+    for i in range(1, len(req["slots"])):
+        prev_ids = [c["id"] for c in req["slots"][i - 1]["commands"]]
+        for cmd in req["slots"][i]["commands"]:
+            if rng.random() < 0.5:
+                k = rng.randint(1, min(5, len(prev_ids)))
+                cmd["allowed_predecessor_ids"] = rng.sample(prev_ids, k)
+    return req
+
+
+def _assert_matches_brute_force(req: dict) -> None:
     expected = brute_force_best(req)
     try:
         result = compile_plan(CompileRequest.model_validate(req))
@@ -82,3 +90,24 @@ def test_dp_matches_brute_force(seed):
         tuple(result["objectives"]["command_id_sequence"]),
     )
     assert got == expected
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_dp_matches_brute_force(seed):
+    rng = random.Random(seed)
+    # 固定 8 隙（穷举规模 2^8~3^8），指令数随机 2~3。
+    n_slots = 8
+    n_cmds = rng.randint(2, 3)
+    req = _make_valid(_random_request(rng, n_slots, n_cmds))
+    _assert_matches_brute_force(req)
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_dp_matches_brute_force_with_predecessor_rules(seed):
+    """挂接接续名单后，DP 仍须与穷举参考逐目标一致（含断链无解）。"""
+    rng = random.Random(10_000 + seed)
+    n_slots = 8
+    n_cmds = rng.randint(2, 3)
+    req = _make_valid(_random_request(rng, n_slots, n_cmds))
+    _add_random_predecessor_rules(rng, req)
+    _assert_matches_brute_force(req)

@@ -6,15 +6,21 @@
 
 要求 p_1 ... p_T 全部位于统一矩形安全域，且 p_T 位于目标矩形。
 
+接续约束：候选指令可声明 ``allowed_predecessor_ids``（紧邻前一时隙允许已选
+指令的编号名单）；声明后，该指令仅可跟在名单中已选编号之后。省略该字段的
+指令不限制前序。接续约束与安全域、目标域一同裁剪状态转移。
+
 优化目标按严格优先级依次最小化：
   1. 总能耗；
   2. 相邻时隙模式切换次数；
   3. 指令编号序列（按字典序）。
 
-实现上以前向动态规划逐层扩展可达前沿。分桶键为 ``(动量, 上一条指令模式)``：
-因为模式切换次数依赖“上一条指令的模式”，同一动量、不同末模式的两条路径
-不能简单互相支配，必须分桶保存；桶内未来代价只取决于桶键，保留字典序最小
-标签即为安全支配。
+实现上以前向动态规划逐层扩展可达前沿。分桶键为
+``(动量, 上一条指令模式, 上一条指令编号)``：模式切换次数依赖“上一条指令的
+模式”，接续约束依赖“上一条指令的编号”，同一动量、不同末模式或不同末编号的
+两条路径不能简单互相支配，必须分桶保存；桶内未来代价与可行集只取决于桶键，
+保留字典序最小标签即为安全支配。未声明接续名单时，末编号细化不改变支配
+关系（同一最优标签唯一），结果与旧两元桶键完全一致。
 """
 
 from dataclasses import dataclass
@@ -23,7 +29,8 @@ from typing import Optional
 from .models import Command, CompileRequest, Rectangle
 
 Vec = tuple[int, int]
-BucketKey = tuple[Vec, Optional[str]]
+# 桶键：(动量, 上一条指令模式, 上一条指令编号)；初始层模式与编号均为 None。
+BucketKey = tuple[Vec, Optional[str], Optional[int]]
 
 # 能耗来自 JSON 浮点，不同指令组合求和可能产生 1e-16 级误差，
 # 该容差内视为能耗并列，交由切换次数与编号序列裁决。
@@ -82,7 +89,7 @@ def _in_rect(p: Vec, rect: Rectangle) -> bool:
 
 
 def _distinct_states(layer: dict[BucketKey, _Node]) -> int:
-    return len({state for state, _mode in layer})
+    return len({state for state, _mode, _prev_id in layer})
 
 
 def compile_plan(request: CompileRequest) -> dict:
@@ -95,8 +102,8 @@ def compile_plan(request: CompileRequest) -> dict:
     safety = request.safety_region
     target = request.target_region
 
-    # layer_t：完成第 t 个时隙后的可达前沿；t=0 只有初始状态、无历史模式。
-    start_key: BucketKey = (initial, None)
+    # layer_t：完成第 t 个时隙后的可达前沿；t=0 只有初始状态、无历史模式与编号。
+    start_key: BucketKey = (initial, None, None)
     layers: list[dict[BucketKey, _Node]] = [
         {start_key: _Node(0.0, 0, (), None, None, None)}
     ]
@@ -105,8 +112,15 @@ def compile_plan(request: CompileRequest) -> dict:
         previous = layers[t - 1]
         current: dict[BucketKey, _Node] = {}
 
-        for (state, prev_mode), node in previous.items():
+        for (state, prev_mode, prev_id), node in previous.items():
             for cmd in slot.commands:
+                # 接续约束：受限指令仅可跟在名单中的已选编号之后。
+                # 首层 prev_id 为 None，受限指令自然不可选（语义校验已禁止
+                # 首时隙声明名单，此处为规划器独立运行的防御）。
+                allowed = cmd.allowed_predecessor_ids
+                if allowed is not None and prev_id not in allowed:
+                    continue
+
                 cx, cy = cmd.correction
                 dx, dy = slot.disturbance
                 nxt_state: Vec = (state[0] + dx + cx, state[1] + dy + cy)
@@ -122,16 +136,16 @@ def compile_plan(request: CompileRequest) -> dict:
                     switches=switches,
                     ids=node.ids + (cmd.id,),
                     mode=cmd.mode,
-                    prev_key=(state, prev_mode),
+                    prev_key=(state, prev_mode, prev_id),
                     command=cmd,
                 )
-                key: BucketKey = (nxt_state, cmd.mode)
+                key: BucketKey = (nxt_state, cmd.mode, cmd.id)
                 incumbent = current.get(key)
                 if incumbent is None or rank_lt(candidate.label(), incumbent.label()):
                     current[key] = candidate
 
         if not current:
-            # 安全域在本时隙被切断：上一层即最后可达层。
+            # 安全域或接续关系在本时隙被切断：上一层即最后可达层。
             raise InfeasiblePlanError(
                 reason="no_safe_path",
                 last_reachable_slot=t - 1,

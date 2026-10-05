@@ -1,8 +1,10 @@
 """请求语义校验：把“输入矛盾”精确定位到字段。
 
 Pydantic 负责类型与基数（8–20 时隙、每时隙 2–5 条指令、二维整数向量、
-非负能耗等），本模块补充跨字段约束：矩形边界顺序、目标域包含于安全域、
-初始动量位于安全域、时隙内指令编号唯一。
+非负能耗、allowed_predecessor_ids 为 1–5 个整数等），本模块补充跨字段约束：
+矩形边界顺序、目标域包含于安全域、初始动量位于安全域、时隙内指令编号唯一，
+以及接续名单的跨时隙约束（首时隙不得提供、名单内互异、编号须存在于紧邻
+前一时隙）。
 """
 
 from .models import CompileRequest
@@ -65,3 +67,29 @@ def validate_semantics(req: CompileRequest) -> None:
                     f"时隙 {t}（0 基）内指令编号 {cmd.id} 重复，编号须在时隙内唯一",
                 )
             seen.add(cmd.id)
+
+    # 接续名单（allowed_predecessor_ids）的跨时隙约束。编号唯一性已在上面确认，
+    # 这里直接按 id 集合引用前一时隙。
+    for t, slot in enumerate(req.slots):
+        for c, cmd in enumerate(slot.commands):
+            allowed = cmd.allowed_predecessor_ids
+            if allowed is None:
+                continue
+            field = f"slots[{t}].commands[{c}].allowed_predecessor_ids"
+            if t == 0:
+                raise SemanticError(
+                    field,
+                    "首时隙没有紧邻前一时隙，不得提供 allowed_predecessor_ids",
+                )
+            if len(set(allowed)) != len(allowed):
+                raise SemanticError(
+                    field,
+                    "allowed_predecessor_ids 内编号须互异（1–5 个不重复整数）",
+                )
+            prev_ids = {prev.id for prev in req.slots[t - 1].commands}
+            for pid in allowed:
+                if pid not in prev_ids:
+                    raise SemanticError(
+                        field,
+                        f"编号 {pid} 不存在于紧邻前一时隙 slots[{t - 1}] 的候选指令中",
+                    )

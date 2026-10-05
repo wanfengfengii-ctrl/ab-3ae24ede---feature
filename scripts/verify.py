@@ -5,7 +5,7 @@
   2. 核对代码测试（pytest 全套）；
   3. 核对镜像构建契约（非 root、应用与工具链可导入、健康端点契约）；
   4. 业务冒烟：可行计划、并列裁决（三级目标）、真实无解诊断、
-     以及参数错误与无解的区分。
+     参数错误与无解的区分、受限接续可行、接续断链无解、旧请求回归。
 """
 
 import json
@@ -58,12 +58,21 @@ def _wait_for_health(timeout: float = 60.0) -> bool:
 
 
 def _slot(disturbance, *commands):
+    """commands: (id, mode, correction, energy[, allowed_predecessor_ids])。"""
+    cmds = []
+    for spec in commands:
+        cmd = {
+            "id": spec[0],
+            "mode": spec[1],
+            "correction": list(spec[2]),
+            "energy": spec[3],
+        }
+        if len(spec) > 4 and spec[4] is not None:
+            cmd["allowed_predecessor_ids"] = list(spec[4])
+        cmds.append(cmd)
     return {
         "disturbance": list(disturbance),
-        "commands": [
-            {"id": cid, "mode": mode, "correction": list(corr), "energy": energy}
-            for cid, mode, corr, energy in commands
-        ],
+        "commands": cmds,
     }
 
 
@@ -115,7 +124,7 @@ def smoke_feasible() -> bool:
     if tuple(data["final_momentum"]) != tuple(data["momentums"][-1]):
         ok = False
 
-    _log(ok, "业务冒烟 1/4：可行计划（选择、逐隙动量、三项目标）")
+    _log(ok, "业务冒烟 1/7：可行计划（选择、逐隙动量、三项目标）")
     return ok
 
 
@@ -132,7 +141,7 @@ def smoke_tie_breaking() -> bool:
         and data["objectives"]["mode_switches"] == 0
         and data["objectives"]["command_id_sequence"] == [3] * 8
     )
-    _log(ok, f"业务冒烟 2/4：并列裁决（能耗→切换数→编号序列） 实际目标={data.get('objectives') if status == 200 else data}")
+    _log(ok, f"业务冒烟 2/7：并列裁决（能耗→切换数→编号序列） 实际目标={data.get('objectives') if status == 200 else data}")
     return ok
 
 
@@ -156,7 +165,7 @@ def smoke_infeasible() -> bool:
     )
     _log(
         ok,
-        f"业务冒烟 3/4：真实无解诊断（409、最后可达时隙、可达状态数） 实际 {status}: {data if not ok else 'last_reachable_slot=0, reachable_states=1'}",
+        f"业务冒烟 3/7：真实无解诊断（409、最后可达时隙、可达状态数） 实际 {status}: {data if not ok else 'last_reachable_slot=0, reachable_states=1'}",
     )
     return ok
 
@@ -175,9 +184,116 @@ def smoke_param_error() -> bool:
     )
     _log(
         ok and located,
-        f"业务冒烟 4/4：参数错误定位字段（422，区别于 409） 实际 {status}: {data}",
+        f"业务冒烟 4/7：参数错误定位字段（422，区别于 409） 实际 {status}: {data}",
     )
     return ok and located
+
+
+def _restricted_slots():
+    """首隙 A 贵 B 便宜；后续隙受限：id=1 只能跟 id=1，id=2 只能跟 id=2。"""
+    first = _slot((0, 0), (1, "A", (0, 0), 5.0), (2, "B", (0, 0), 1.0))
+    rest = _slot(
+        (0, 0),
+        (1, "A", (0, 0), 0.1, [1]),
+        (2, "B", (0, 0), 0.2, [2]),
+    )
+    return [first] + [rest] * 7
+
+
+def smoke_restricted_continuation() -> bool:
+    """受限接续可行：接续约束参与全局最优，响应可逐隙复核接续关系。"""
+    slots = _restricted_slots()
+    status, data = _post_json(COMPILE_URL, _base_body(slots))
+    if status != 200 or not data.get("feasible"):
+        _log(False, f"受限接续应可行，实际 {status}: {data}")
+        return False
+
+    obj = data["objectives"]
+    # 不受限最优（首隙 B 后接 A，能耗 1.7）穿越接续断点被排除；
+    # 合法链只剩 全A(5.7) 与 全B(2.4)，最优为全 B：能耗 2.4、零切换、编号全 2。
+    ok = (
+        abs(obj["total_energy"] - 2.4) < 1e-9
+        and obj["mode_switches"] == 0
+        and obj["command_id_sequence"] == [2] * 8
+    )
+
+    # 逐隙复核：每条受限指令的前序已选编号都在其名单内。
+    selected = data["selected"]
+    for i in range(1, len(selected)):
+        chosen = next(
+            c for c in slots[i]["commands"] if c["id"] == selected[i]["command_id"]
+        )
+        allowed = chosen.get("allowed_predecessor_ids")
+        if allowed is not None and selected[i - 1]["command_id"] not in allowed:
+            ok = False
+
+    _log(ok, f"业务冒烟 5/7：受限接续可行（约束参与全局最优） 实际目标={obj}")
+    return ok
+
+
+def smoke_chain_broken() -> bool:
+    """接续断链无解：合法输入返回 409，准确定位最后可达时隙与可达动量数。"""
+    # 第 1 隙 id=1 越出安全域（x 只容 0）；第 2 隙全部指令只认 id=1 → 断链。
+    region = {"x_min": 0, "x_max": 0, "y_min": -10, "y_max": 10}
+    slots = [
+        _slot((0, 0), (1, "A", (1, 0), 1.0), (2, "B", (0, 0), 1.0)),
+        _slot((0, 0), (1, "A", (0, 0), 1.0, [1]), (2, "B", (0, 0), 1.0, [1])),
+    ] + [
+        _slot((0, 0), (1, "A", (0, 0), 1.0), (2, "B", (0, 0), 1.0))
+        for _ in range(6)
+    ]
+    body = _base_body(slots, safety=dict(region), target=dict(region))
+    status, data = _post_json(COMPILE_URL, body)
+    ok = (
+        status == 409
+        and data.get("error") == "no_feasible_plan"
+        and data.get("last_reachable_slot") == 1
+        and data.get("reachable_states") == 1
+    )
+    _log(
+        ok,
+        f"业务冒烟 6/7：接续断链无解（409、最后可达时隙、可达动量数） 实际 {status}: {data if not ok else 'last_reachable_slot=1, reachable_states=1'}",
+    )
+    return ok
+
+
+def smoke_legacy_regression() -> bool:
+    """旧请求回归：未使用新字段时响应与既有最优结果一致。"""
+    # 每隙 id=1(A, 1.0) / id=2(B, 0.5)：最优为全 2，能耗 4.0、零切换。
+    slots = [
+        _slot((0, 0), (1, "A", (0, 0), 1.0), (2, "B", (0, 0), 0.5))
+    ] * 8
+    status, data = _post_json(COMPILE_URL, _base_body(slots))
+    obj = data.get("objectives", {})
+    ok = (
+        status == 200
+        and data.get("feasible") is True
+        and obj.get("total_energy") == 4.0
+        and obj.get("mode_switches") == 0
+        and obj.get("command_id_sequence") == [2] * 8
+        and len(data.get("selected", [])) == 8
+        and len(data.get("momentums", [])) == 8
+    )
+
+    # 同一窗口给每条指令挂上“列全前隙编号”的空转名单，响应须逐字节一致。
+    decorated = _base_body(
+        [
+            _slot((0, 0), (1, "A", (0, 0), 1.0), (2, "B", (0, 0), 0.5)),
+        ]
+        + [
+            _slot(
+                (0, 0),
+                (1, "A", (0, 0), 1.0, [1, 2]),
+                (2, "B", (0, 0), 0.5, [1, 2]),
+            )
+        ]
+        * 7
+    )
+    status2, data2 = _post_json(COMPILE_URL, decorated)
+    ok = ok and status2 == 200 and data2 == data
+
+    _log(ok, f"业务冒烟 7/7：旧请求回归（最优结果与响应形态不变） 实际目标={obj if status == 200 else data}")
+    return ok
 
 
 def image_contract() -> bool:
@@ -220,6 +336,9 @@ def main() -> int:
         smoke_tie_breaking(),
         smoke_infeasible(),
         smoke_param_error(),
+        smoke_restricted_continuation(),
+        smoke_chain_broken(),
+        smoke_legacy_regression(),
     ]
     print("\n=== 核验汇总 ===")
     print(f"通过 {sum(results)}/{len(results)} 项")
